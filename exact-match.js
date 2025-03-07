@@ -63,7 +63,7 @@ function main() {
     var awql = ""
       + "SELECT Query, AdGroupId, CampaignId "
       + "FROM SEARCH_QUERY_PERFORMANCE_REPORT "
-      + "WHERE CampaignStatus = ENABLED "
+      + "WHERE campaignId = 22047055864 "
       + "AND AdGroupStatus = ENABLED "
       + "DURING " + dateRange;
 
