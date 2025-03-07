@@ -1,283 +1,207 @@
 function main() {
   /*******************************************************
-   *  CONFIG
+   *  CONFIGURATION
    *******************************************************/
-  // If true, logs only (no negatives actually created).
   var DRY_RUN = false;
-
-  // If true, add negatives at campaign level, otherwise at ad group level.
   var NEGATIVE_AT_CAMPAIGN_LEVEL = true;
+  var CONVERSION_LOOKBACK = 'LAST_14_DAYS';  // Lookback window for conversions
+  var VALUE_LOOKBACK_DAYS = 90;  // Lookback window for all conversion value (by conversion time)
+  var VALUE_THRESHOLD = 1000;  // Min All Conversion Value to remove negative
+  var TARGET_CAMPAIGN_NAMES = [
+    "EUR_Search_Brand_Competitors",
+    "AMER_Search_Brand_Competitors",
+    "AMER_Search_Brand_Medium"
+  ];
 
-  // We want two date ranges: 'TODAY' and 'LAST_7_DAYS'.
-  var DATE_RANGES = ['TODAY', 'LAST_7_DAYS'];
+  var today = new Date();
+  var endDate = formatDate(today);
+  var startDate = formatDate(new Date(today.setDate(today.getDate() - VALUE_LOOKBACK_DAYS)));
 
   /*******************************************************
-   *  STEP 1: Collect ACTIVE Keywords by AdGroup or Campaign
+   *  STEP 1: Collect Active Keywords That Have Clicks
    *******************************************************/
-  // We will store all enabled keyword texts in a map keyed by either
-  // campaignId or adGroupId, depending on NEGATIVE_AT_CAMPAIGN_LEVEL.
-
   var campaignIdToKeywords = {};
-  var adGroupIdToKeywords  = {};
+  var campaignNameToId = {};
+
+  var campaignIterator = AdsApp.campaigns()
+    .withCondition("CampaignStatus = ENABLED")
+    .get();
+
+  while (campaignIterator.hasNext()) {
+    var campaign = campaignIterator.next();
+    var campaignName = campaign.getName();
+    var campaignId = campaign.getId();
+
+    if (TARGET_CAMPAIGN_NAMES.includes(campaignName)) {
+      campaignNameToId[campaignName] = campaignId;
+      campaignIdToKeywords[campaignId] = [];
+    }
+  }
 
   var keywordIterator = AdsApp.keywords()
+    .withCondition("CampaignStatus = ENABLED")
+    .withCondition("AdGroupStatus = ENABLED")
     .withCondition("Status = ENABLED")
+    .withCondition("Clicks > 0")  // Ensure keyword received clicks
     .get();
 
   while (keywordIterator.hasNext()) {
     var kw = keywordIterator.next();
     var campaignId = kw.getCampaign().getId();
-    var adGroupId  = kw.getAdGroup().getId();
-    var kwText     = kw.getText(); // e.g. "[web scraping api]"
+    var kwText = kw.getText().replace(/^\[|\]$/g, "").trim();
 
-    // Remove brackets/quotes if you only want the textual portion
-    // Or keep them if you prefer. Usually best to store raw textual pattern 
-    // (like [web scraping api]) so you can do advanced checks.
-    // For the "plural ignoring" logic, we'll want the raw words minus brackets.
-    var cleanedText = kwText
-      .replace(/^\[|\]$/g, "")  // remove leading/trailing [ ]
-      .trim();
-
-    // If we are going to add negatives at campaign level,
-    // group your keywords by campaign. Otherwise group by ad group.
-    if (NEGATIVE_AT_CAMPAIGN_LEVEL) {
-      if (!campaignIdToKeywords[campaignId]) {
-        campaignIdToKeywords[campaignId] = [];
-      }
-      campaignIdToKeywords[campaignId].push(cleanedText);
-    } else {
-      if (!adGroupIdToKeywords[adGroupId]) {
-        adGroupIdToKeywords[adGroupId] = [];
-      }
-      adGroupIdToKeywords[adGroupId].push(cleanedText);
+    if (campaignIdToKeywords.hasOwnProperty(campaignId)) {
+      campaignIdToKeywords[campaignId].push(kwText);
     }
   }
 
   /*******************************************************
-   *  STEP 2: Fetch Search Terms for Multiple Date Ranges
+   *  STEP 2: Fetch Search Terms (14-day conversions)
    *******************************************************/
-  var combinedQueries = {}; 
-  // We'll use an object to store unique queries keyed by "query|adGroupId|campaignId"
+  var combinedQueries = {};
+  var highValueQueries = new Set();
 
-  DATE_RANGES.forEach(function(dateRange) {
-    var awql = ""
-      + "SELECT Query, AdGroupId, CampaignId "
-      + "FROM SEARCH_QUERY_PERFORMANCE_REPORT "
-      + "WHERE CampaignStatus = ENABLED "
-      + "AND AdGroupStatus = ENABLED "
-      + "DURING " + dateRange;
+  var conversionAwql = `
+    SELECT Query, CampaignId, Conversions, AllConversionValue
+    FROM SEARCH_QUERY_PERFORMANCE_REPORT
+    WHERE CampaignStatus = ENABLED
+    AND AdGroupStatus = ENABLED
+    AND Clicks > 0
+    DURING ${CONVERSION_LOOKBACK}`;
 
-    var report = AdsApp.report(awql);
-    var rows = report.rows();
-    while (rows.hasNext()) {
-      var row = rows.next();
-      var query      = row["Query"];
-      var adGroupId  = row["AdGroupId"];
-      var campaignId = row["CampaignId"];
+  var conversionReport = AdsApp.report(conversionAwql);
+  var conversionRows = conversionReport.rows();
 
-      var key = query + "|" + adGroupId + "|" + campaignId;
-      combinedQueries[key] = {
-        query: query,
-        adGroupId: adGroupId,
-        campaignId: campaignId
-      };
+  while (conversionRows.hasNext()) {
+    var row = conversionRows.next();
+    var query = row["Query"];
+    var campaignId = row["CampaignId"];
+    var conversions = parseFloat(row["Conversions"]);
+    var conversionValue = parseFloat(row["AllConversionValue"]);
+
+    if (campaignIdToKeywords.hasOwnProperty(campaignId)) {
+      if (!combinedQueries[query]) {
+        combinedQueries[query] = { query, campaignId, conversions, conversionValue };
+      } else {
+        combinedQueries[query].conversions += conversions;
+        combinedQueries[query].conversionValue += conversionValue;
+      }
     }
+  }
+
+  /*******************************************************
+   *  STEP 3: Fetch Long-Term (90-Day) Conversion Value
+   *******************************************************/
+  var longTermAwql = `
+    SELECT Query, CampaignId, AllConversionValue
+    FROM SEARCH_QUERY_PERFORMANCE_REPORT
+    WHERE CampaignStatus = ENABLED
+    AND AdGroupStatus = ENABLED
+    AND Clicks > 0
+    DURING ${startDate},${endDate}`;
+
+  var longTermReport = AdsApp.report(longTermAwql);
+  var longTermRows = longTermReport.rows();
+
+  while (longTermRows.hasNext()) {
+    var row = longTermRows.next();
+    var query = row["Query"];
+    var campaignId = row["CampaignId"];
+    var conversionValue = parseFloat(row["AllConversionValue"]);
+
+    if (campaignIdToKeywords.hasOwnProperty(campaignId) && conversionValue > VALUE_THRESHOLD) {
+      highValueQueries.add(query);
+    }
+  }
+
+  /*******************************************************
+   *  STEP 4: Remove Negatives for High-Value Queries
+   *******************************************************/
+  highValueQueries.forEach(function (query) {
+    removeNegativeKeyword(query, combinedQueries[query].campaignId);
   });
 
   /*******************************************************
-   *  STEP 3: For each unique query, see if it matches ANY
-   *          active keyword in that ad group or campaign.
+   *  STEP 5: Add Negatives for Non-Converting Queries (Distinct Variants)
    *******************************************************/
   var totalNegativesAdded = 0;
-  
-  for (var uniqueKey in combinedQueries) {
-    var data       = combinedQueries[uniqueKey];
-    var query      = data.query;
-    var adGroupId  = data.adGroupId;
+
+  for (var query in combinedQueries) {
+    var data = combinedQueries[query];
     var campaignId = data.campaignId;
 
-    // Pull out the relevant array of keywords
-    var relevantKeywords;
-    if (NEGATIVE_AT_CAMPAIGN_LEVEL) {
-      relevantKeywords = campaignIdToKeywords[campaignId] || [];
-    } else {
-      relevantKeywords = adGroupIdToKeywords[adGroupId] || [];
+    if (highValueQueries.has(query)) {
+      Logger.log("SKIP negative — Query '" + query + "' has high All Conv. Value.");
+      continue;
     }
 
-    // Decide if `query` is equivalent to AT LEAST one of those 
-    // keywords, ignoring major plurals. If so, skip adding negative.
-    var isEquivalentToSomeKeyword = false;
+    var isSimilarToExisting = campaignIdToKeywords[campaignId].some(kwText =>
+      isSimilarKeyword(kwText, query)
+    );
 
-    for (var i = 0; i < relevantKeywords.length; i++) {
-      var kwText = relevantKeywords[i];
-      // Check if they are the same ignoring plurals
-      if (areEquivalentIgnoringMajorPlurals(kwText, query)) {
-        isEquivalentToSomeKeyword = true;
-        break;
-      }
-    }
-
-    // If NOT equivalent, we add a negative EXACT match
-    if (!isEquivalentToSomeKeyword) {
-      if (NEGATIVE_AT_CAMPAIGN_LEVEL) {
-        // Add negative at campaign level
-        var campIt = AdsApp.campaigns().withIds([campaignId]).get();
-        if (campIt.hasNext()) {
-          var campaign = campIt.next();
-          if (!negativeAlreadyExists(null, campaign, query, true)) {
-            if (DRY_RUN) {
-              Logger.log("DRY RUN: Would add negative [" + query + "] at campaign: " 
-                         + campaign.getName());
-            } else {
-              campaign.createNegativeKeyword("[" + query + "]");
-              Logger.log("ADDED negative [" + query + "] at campaign: " + campaign.getName());
-              totalNegativesAdded++;
-            }
-          }
-        }
-      } else {
-        // Add negative at ad group level
-        var adgIt = AdsApp.adGroups().withIds([adGroupId]).get();
-        if (adgIt.hasNext()) {
-          var adGroup = adgIt.next();
-          if (!negativeAlreadyExists(adGroup, null, query, false)) {
-            if (DRY_RUN) {
-              Logger.log("DRY RUN: Would add negative [" + query + "] at ad group: " 
-                         + adGroup.getName());
-            } else {
-              adGroup.createNegativeKeyword("[" + query + "]");
-              Logger.log("ADDED negative [" + query + "] at ad group: " + adGroup.getName());
-              totalNegativesAdded++;
-            }
-          }
+    if (!isSimilarToExisting) {
+      var campaign = AdsApp.campaigns().withIds([campaignId]).get().next();
+      if (!negativeAlreadyExists(campaign, query)) {
+        if (DRY_RUN) {
+          Logger.log("DRY RUN: Would add negative [" + query + "] at campaign: " + campaign.getName());
+        } else {
+          campaign.createNegativeKeyword("[" + query + "]");
+          Logger.log("ADDED negative [" + query + "] at campaign: " + campaign.getName());
+          totalNegativesAdded++;
         }
       }
     } else {
-      Logger.log("SKIP negative — Query '" + query + "' matches at least one keyword");
+      Logger.log("SKIP negative — Query '" + query + "' is similar to an existing keyword.");
     }
   }
 
   Logger.log("Done. Negatives added: " + totalNegativesAdded);
 }
 
-/**
- * Helper: Checks if an exact-match negative `[term]` 
- * already exists at the chosen level (ad group or campaign).
- *
- * @param {AdGroup|null}   adGroup   The ad group object (if adding at ad group level)
- * @param {Campaign|null}  campaign  The campaign object (if adding at campaign level)
- * @param {string}         term      The user query to block
- * @param {boolean}        isCampaignLevel  True => campaign-level
- * @returns {boolean}      True if negative already exists
- */
-function negativeAlreadyExists(adGroup, campaign, term, isCampaignLevel) {
-  var negIter;
-  if (isCampaignLevel) {
-    negIter = campaign
-      .negativeKeywords()
-      .withCondition("KeywordText = '" + term + "'")
-      .get();
-  } else {
-    negIter = adGroup
-      .negativeKeywords()
-      .withCondition("KeywordText = '" + term + "'")
-      .get();
-  }
-  
+/*******************************************************
+ *  FUNCTION: Remove Negative Keyword If It Has High Conversion Value
+ *******************************************************/
+function removeNegativeKeyword(query, campaignId) {
+  var campaign = AdsApp.campaigns().withIds([campaignId]).get().next();
+  var negIter = campaign.negativeKeywords()
+    .withCondition("KeywordText = '" + query + "'")
+    .get();
+
   while (negIter.hasNext()) {
-    var neg = negIter.next();
-    if (neg.getMatchType() === "EXACT") {
-      return true;
+    var negKeyword = negIter.next();
+    if (DRY_RUN) {
+      Logger.log("DRY RUN: Would REMOVE negative [" + query + "]");
+    } else {
+      negKeyword.remove();
+      Logger.log("REMOVED negative [" + query + "] from campaign: " + campaign.getName());
     }
   }
-  return false;
 }
 
-/**
- * Returns true if `query` is effectively the same as `kwText`,
- * ignoring major plural variations (including s, es, ies,
- * plus some common irregulars).
- */
-function areEquivalentIgnoringMajorPlurals(kwText, query) {
-  // Convert each to lower case and strip brackets if needed.
-  // E.g. " [web scraping api]" => "web scraping api"
-  var kwWords = kwText
-    .toLowerCase()
-    .replace(/^\[|\]$/g, "")
-    .trim()
-    .split(/\s+/);
-
-  var qWords = query
-    .toLowerCase()
-    .split(/\s+/);
-
-  if (kwWords.length !== qWords.length) {
-    return false;
-  }
-
-  for (var i = 0; i < kwWords.length; i++) {
-    if (singularize(kwWords[i]) !== singularize(qWords[i])) {
-      return false;
-    }
-  }
-  return true;
+/*******************************************************
+ *  FUNCTION: Check If Query Is a Similar Variant of a Keyword
+ *******************************************************/
+function isSimilarKeyword(kwText, query) {
+  return kwText.replace(/\s+/g, "").toLowerCase() === query.replace(/\s+/g, "").toLowerCase() ||
+         kwText.replace(/\s+/g, "").includes(query.replace(/\s+/g, "")) ||
+         query.replace(/\s+/g, "").includes(kwText.replace(/\s+/g, ""));
 }
 
-/** 
- * Convert word to “singular” for matching. This handles:
- * 
- * - A set of well-known irregular plurals
- * - Typical endings: "ies" => "y", "es" => "", "s" => "" 
- */
-function singularize(word) {
-  var IRREGULARS = {
-    "children": "child",
-    "men": "man",
-    "women": "woman",
-    "geese": "goose",
-    "feet": "foot",
-    "teeth": "tooth",
-    "people": "person",
-    "mice": "mouse",
-    "knives": "knife",
-    "wives": "wife",
-    "lives": "life",
-    "calves": "calf",
-    "leaves": "leaf",
-    "wolves": "wolf",
-    "selves": "self",
-    "elves": "elf",
-    "halves": "half",
-    "loaves": "loaf",
-    "scarves": "scarf",
-    "octopi": "octopus",
-    "cacti": "cactus",
-    "foci": "focus",
-    "fungi": "fungus",
-    "nuclei": "nucleus",
-    "syllabi": "syllabus",
-    "analyses": "analysis",
-    "diagnoses": "diagnosis",
-    "oases": "oasis",
-    "theses": "thesis",
-    "crises": "crisis",
-    "phenomena": "phenomenon",
-    "criteria": "criterion",
-    "data": "datum",
-    "media": "medium"
-  };
+/*******************************************************
+ *  FUNCTION: Check If Negative Already Exists
+ *******************************************************/
+function negativeAlreadyExists(campaign, term) {
+  var negIter = campaign
+    .negativeKeywords()
+    .withCondition("KeywordText = '" + term + "'")
+    .get();
 
-  var lower = word.toLowerCase();
-  if (IRREGULARS[lower]) {
-    return IRREGULARS[lower];
-  }
+  return negIter.hasNext();
+}
 
-  if (lower.endsWith("ies") && lower.length > 3) {
-    return lower.substring(0, lower.length - 3) + "y";
-  } else if (lower.endsWith("es") && lower.length > 2) {
-    return lower.substring(0, lower.length - 2);
-  } else if (lower.endsWith("s") && lower.length > 1) {
-    return lower.substring(0, lower.length - 1);
-  }
-  return lower;
+/*******************************************************
+ *  FUNCTION: Format Date for Google Ads Query
+ *******************************************************/
+function formatDate(date) {
+  return date.getFullYear() + ('0' + (date.getMonth() + 1)).slice(-2) + ('0' + date.getDate()).slice(-2);
 }
