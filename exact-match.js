@@ -8,9 +8,8 @@ function main() {
   var VALUE_LOOKBACK_DAYS = 90;  // Lookback window for all conversion value (by conversion time)
   var VALUE_THRESHOLD = 1000;  // Min All Conversion Value to remove negative
   var TARGET_CAMPAIGN_NAMES = [
-    "EUR_Search_Brand_Competitors",
-    "AMER_Search_Brand_Competitors",
-    "AMER_Search_Brand_Medium"
+    "INPUT_YOUR_CAMPAIGN_NAME_HERE",
+    "INPUT_YOUR_CAMPAIGN_NAME_HERE"
   ];
 
   var today = new Date();
